@@ -1,0 +1,2 @@
+model_type: YOLO
+model_path: C:\Users\wiese\Desktop\tmp\SPIE_allrealimg_supercats_large_run\run_1\weights\best.pt
