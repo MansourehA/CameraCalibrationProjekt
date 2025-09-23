@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.log
+
+# --- IDE / Editor ---
+.idea/
+.vscode/
+*.iml
+
+# --- Betriebssystem ---
+.DS_Store
+Thumbs.db
+
+# --- Virtuelle Umgebungen ---
+.venv/
+env/
+venv/
+
+# --- Projekt-spezifisch ---
+# gespeicherte Bilder und Captures nicht ins Repo laden
+camera_calibration/Camera*_Captures/
+
+# Ergebnisse der Kalibrierung separat speichern, nicht versionieren
+camera_calibration/CalibrationResults_*/
+
+# temporäre Dateien oder Ausgaben
+*.npy
+*.npz
+*.tmp
+*.bak
+
+# Jupyter Notebook checkpoints (falls du Notebooks nutzt)
+.ipynb_checkpoints/
