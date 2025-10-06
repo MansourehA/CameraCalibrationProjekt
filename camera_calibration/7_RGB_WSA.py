@@ -83,6 +83,7 @@ if len(all_corners) > 0 and img_size is not None:
         os.makedirs(save_dir)
     np.save(os.path.join(save_dir, f'{camera_serial}_rgb_camera_matrix.npy'), camera_matrix)
     np.save(os.path.join(save_dir, f'{camera_serial}_rgb_distortion_coeffs.npy'), distortion_coeffs)
+    np.save(os.path.join(save_dir, f'{camera_serial}_rgb_reprojection_error.npy'), ret)
 
 print(f"Finished calibration for RGB Camera {camera_serial}.\n")
 print("RGB camera calibration done.")

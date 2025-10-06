@@ -2,10 +2,11 @@ import numpy as np
 import cv2
 import glob
 import os
+import json
 
 print(cv2.__version__)
 
-def calibrate_tof_camera(image_dir, num_rows, num_cols, square_length_mm, marker_length_mm):
+def calibrate_tof_camera(image_dir, num_rows, num_cols, square_length_mm, marker_length_mm, camera_serial="ToF_Camera"):
     # --- Charuco-Board Definition ---
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
     board = cv2.aruco.CharucoBoard(
@@ -94,18 +95,37 @@ def calibrate_tof_camera(image_dir, num_rows, num_cols, square_length_mm, marker
     print("Verzerrungskoeffizienten (Dist):\n", distortion_coeffs.ravel())
     print(f"Reprojektion Fehler (RMS): {reprojection_error:.4f}")
 
+    # --- Ergebnisse speichern ---
+    save_dir = os.path.join(image_dir, "CalibrationResults_TOF_7")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # numpy Dateien
+    np.save(os.path.join(save_dir, f'{camera_serial}_tof_camera_matrix.npy'), camera_matrix)
+    np.save(os.path.join(save_dir, f'{camera_serial}_tof_distortion_coeffs.npy'), distortion_coeffs)
+    np.save(os.path.join(save_dir, f'{camera_serial}_tof_reprojection_error.npy'), reprojection_error)
+
+    # JSON-Datei für einfache Lesbarkeit
+    results = {
+        "camera_matrix": camera_matrix.tolist(),
+        "distortion_coeffs": distortion_coeffs.ravel().tolist(),
+        "reprojection_error": float(reprojection_error)
+    }
+    with open(os.path.join(save_dir, f'{camera_serial}_tof_calibration.json'), "w") as f:
+        json.dump(results, f, indent=4)
+
     return camera_matrix, distortion_coeffs, reprojection_error
 
 
 # --------------------------
 # Anwendung
 if __name__ == "__main__":
-    image_folder = r"D:\CameraCalibrationProjekt\camera_calibration\Camera7_Captures\TofRGB"
+    image_folder = r"D:\CameraCalibrationProjekt\camera_calibration\Camera7_Captures\Holz\000369930112"
 
     calibrate_tof_camera(
         image_dir=image_folder,
-        num_rows=7,
-        num_cols=10,
-        square_length_mm=80,
-        marker_length_mm=60
+        num_rows=10,
+        num_cols=7,
+        square_length_mm=65,
+        marker_length_mm=48,
+        camera_serial="000369930112"
     )
