@@ -44,6 +44,16 @@ def load_intrinsics_any(folder):
     raise FileNotFoundError(f"Keine Intrinsics in {folder} gefunden.")
 
 # ---------- Dateisammlung & Paarung ----------
+def scale_K(K, from_size, to_size):
+    """Skaliert Kameramatrix K von ursprünglicher Kalibriergröße auf neue Bildgröße."""
+    sx = to_size[0] / from_size[0]
+    sy = to_size[1] / from_size[1]
+    K2 = K.copy().astype(np.float64)
+    K2[0, 0] *= sx  # fx
+    K2[1, 1] *= sy  # fy
+    K2[0, 2] *= sx  # cx
+    K2[1, 2] *= sy  # cy
+    return K2
 def last_int_in_name(path):
     nums = re.findall(r'(\d+)', os.path.basename(path))
     return int(nums[-1]) if nums else -1
@@ -148,6 +158,11 @@ def project_debug(rgb, K, dist, board, R, t):
 
 # ------------------------ Main ------------------------
 def main():
+    # Ursprüngliche Auflösungen aus den Intrinsic-Kalibrierungen
+    # (Falls du sie nicht gespeichert hast, schätz sie manuell!)
+    RGB_CALIB_SIZE = (1920, 1080)  # (Breite, Höhe) z.B. für Azure RGB
+    TOF_CALIB_SIZE = (1024, 1024)  # (Breite, Höhe) z.B. für Azure IR
+
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     K_rgb, D_rgb = load_intrinsics_any(RGB_INTR_DIR)
@@ -167,27 +182,45 @@ def main():
         raise RuntimeError("Keine passenden Dateien gefunden.")
 
     R_list, t_list, used = [], [], 0
+    R_list, t_list, used = [], [], 0
     for (rgb_path, ir_tagpath, idx) in pairs:
         rgb = cv2.imread(rgb_path)
         irg = load_ir_gray(ir_tagpath)
         if rgb is None or irg is None:
-            print(f"[{idx}] Lesen fehlgeschlagen.");
+            print(f"[{idx}] Lesen fehlgeschlagen.")
             continue
 
-        cr_rgb, id_rgb, vis_rgb, n_rgb = detect_charuco(cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY), board, detector)
-        cr_ir,  id_ir,  vis_ir,  n_ir  = detect_charuco(irg, board, detector)
+        gray_rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+
+        # --- NEU: K-Matrizen skalieren auf tatsächliche Bildgröße ---
+        h_rgb, w_rgb = gray_rgb.shape[:2]
+        h_ir, w_ir = irg.shape[:2]
+
+        K_rgb_use = scale_K(K_rgb, RGB_CALIB_SIZE, (w_rgb, h_rgb))
+        K_tof_use = scale_K(K_tof, TOF_CALIB_SIZE, (w_ir, h_ir))
+
+        # Verzerrung deaktivieren (weil Bilder schon undistorted sind)
+        D_rgb_use = np.zeros((1, 5), np.float32)
+        D_tof_use = np.zeros((1, 5), np.float32)
+        # -------------------------------------------------------------
+
+        cr_rgb, id_rgb, vis_rgb, n_rgb = detect_charuco(gray_rgb, board, detector)
+        cr_ir, id_ir, vis_ir, n_ir = detect_charuco(irg, board, detector)
 
         cv2.imwrite(os.path.join(SAVE_DIR, f"detect_rgb_{idx:03d}.png"), vis_rgb)
-        cv2.imwrite(os.path.join(SAVE_DIR, f"detect_ir_{idx:03d}.png"),  vis_ir)
+        cv2.imwrite(os.path.join(SAVE_DIR, f"detect_ir_{idx:03d}.png"), vis_ir)
 
         if n_rgb < MIN_CHARUCO or n_ir < MIN_CHARUCO:
-            print(f"[{idx}] zu wenige Ecken (RGB={n_rgb}, IR={n_ir})");
+            print(f"[{idx}] zu wenige Ecken (RGB={n_rgb}, IR={n_ir})")
             continue
 
-        R_rgb, t_rgb = pose_from_charuco(K_rgb, D_rgb, cr_rgb, id_rgb, board)
-        R_tof, t_tof = pose_from_charuco(K_tof, D_tof, cr_ir,  id_ir,  board)
+        # --- NEU: PnP mit skalierten Intrinsics ---
+        R_rgb, t_rgb = pose_from_charuco(K_rgb_use, D_rgb_use, cr_rgb, id_rgb, board)
+        R_tof, t_tof = pose_from_charuco(K_tof_use, D_tof_use, cr_ir, id_ir, board)
+        # -------------------------------------------
+
         if R_rgb is None or R_tof is None:
-            print(f"[{idx}] solvePnP fehlgeschlagen");
+            print(f"[{idx}] solvePnP fehlgeschlagen")
             continue
 
         R_rgb_tof = R_rgb @ R_tof.T

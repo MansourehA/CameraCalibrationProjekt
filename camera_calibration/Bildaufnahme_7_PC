@@ -1,0 +1,208 @@
+import os
+import sys
+import time
+import glob
+import numpy as np
+import cv2
+from matplotlib import pyplot as plt
+from pyk4a import PyK4A, Config, ColorResolution, DepthMode, ImageFormat, FPS
+
+RGB_CAL_DIR = r"W:\CameraCalibration\Camera7_Captures\TOFSRGB\CalibrationResults_RGB"
+TOF_CAL_DIR = r"W:\CameraCalibration\Camera7_Captures\TOFSRGB\CalibrationResults_TOF_7"
+
+BASE_SAVE = r"W:\CameraCalibration\Camera7_Captures\TOFSRGB\pvc_grau"
+TARGET_SERIAL = "000369930112"
+DEVICE_ID = 0
+SCALE_PREVIEW = 0.3
+SHOW_PREVIEW = True
+
+def load_calib_npys(folder, prefix_hint=""):
+    #  suchen nach *camera_matrix.npy و *distortion_coeffs.npy
+    def pick(pattern_fallback):
+        cands = glob.glob(os.path.join(folder, f"{prefix_hint}*{pattern_fallback}"))
+        if not cands:
+            cands = glob.glob(os.path.join(folder, f"*{pattern_fallback}"))
+        if not cands:
+            raise FileNotFoundError(f"File not found: {pattern_fallback} در {folder}")
+        return cands[0]
+
+    k_path = pick("camera_matrix.npy")
+    d_path = pick("distortion_coeffs.npy")
+
+    K = np.load(k_path)
+    dist = np.load(d_path)
+    return K, dist
+
+
+def build_undistort_maps(K, dist, img_size):
+    h, w = img_size
+    newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0.0, newImgSize=(w, h))
+    map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, newK, (w, h), cv2.CV_16SC2)
+    return map1, map2, newK
+
+def show_scaled(win, img, scale=0.3):
+    if not SHOW_PREVIEW:
+        return
+    h, w = img.shape[:2]
+    small = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+    cv2.imshow(win, small)
+    cv2.waitKey(1)
+
+
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+from utils.Code.helperfunctions import read_config
+
+class KinectCamera:
+    def __init__(self, device_id):
+        self.config = read_config(r"W:\CameraCalibration\CONFIGS\Kinect.yaml")
+        self.device_id = device_id
+        self.azure_config = Config(
+            color_resolution=ColorResolution(self.config['ColorResolution']),
+            color_format=ImageFormat(self.config['ImageFormat']),
+            depth_mode=DepthMode(self.config['DepthMode']),
+            camera_fps=FPS(self.config['FPS']),
+            synchronized_images_only=self.config.get('SynchronizedImagesOnly', False)
+        )
+        self.k4a = PyK4A(config=self.azure_config, device_id=self.device_id)
+        self.k4a.open()
+        self.serial = self.k4a.serial
+        print(f"Kamera geöffnet – Seriennummer: {self.serial}")
+
+    def get_capture(self):
+        self.k4a.start()
+        cap = self.k4a.get_capture()
+        self.k4a.stop()
+        return cap
+
+    def close(self):
+        self.k4a.close()
+
+
+if __name__ == "__main__":
+    time.sleep(1)
+
+    # Speicherplatz
+    save_folder = os.path.join(BASE_SAVE, TARGET_SERIAL)
+    undist_dir   = os.path.join(save_folder, "undistorted")
+    os.makedirs(save_folder, exist_ok=True)
+    os.makedirs(undist_dir, exist_ok=True)
+
+    #intrinsische kalibrierung
+    print("Lade RGB-Kalibrierung…")
+    rgb_K, rgb_dist = load_calib_npys(RGB_CAL_DIR, prefix_hint=TARGET_SERIAL)
+    print("Lade ToF/IR-Kalibrierung…")
+    tof_K, tof_dist = load_calib_npys(TOF_CAL_DIR, prefix_hint=TARGET_SERIAL)
+
+    # Kamera
+    cam = KinectCamera(DEVICE_ID)
+    if cam.serial != TARGET_SERIAL:
+        print("Die Seriennummer passt nicht zur angegebenen Kamera.")
+        cam.close()
+        sys.exit(1)
+
+    print(f"Kamera {TARGET_SERIAL} erkannt. Aufnahme…")
+    capture = cam.get_capture()
+
+    color = capture.color  # BGRA
+    depth = capture.depth  # uint16 (mm)
+    ir    = capture.ir     # uint16
+
+    if color is not None:
+        color_bgr = cv2.cvtColor(color, cv2.COLOR_BGRA2BGR)
+    else:
+        color_bgr = None
+
+    # make a undisort
+    rgb_map = None
+    ir_map  = None
+
+    # File_Num
+    existing = [f for f in os.listdir(save_folder) if f.endswith((".png", ".npy"))]
+    idx = len(existing) + 1
+
+    # RAW + Preview
+    if color_bgr is not None:
+        raw_color_path = os.path.join(save_folder, f"color_{idx}.png")
+        cv2.imwrite(raw_color_path, color_bgr)
+        print(f"RGB RAW gespeichert: {os.path.basename(raw_color_path)}")
+        show_scaled("RGB RAW", color_bgr, SCALE_PREVIEW)
+
+    if depth is not None:
+        np.save(os.path.join(save_folder, f"depth_{idx}.npy"), depth)
+        print(f"Depth RAW gespeichert: depth_{idx}.npy")
+
+    if ir is not None:
+        np.save(os.path.join(save_folder, f"ir_{idx}_raw.npy"), ir)
+        ir_norm8 = cv2.convertScaleAbs(ir, alpha=255.0/max(1, np.max(ir)))
+        cv2.imwrite(os.path.join(save_folder, f"ir_{idx}.png"), ir_norm8)
+        print(f"IR RAW gespeichert: ir_{idx}_raw.npy und ir_{idx}.png")
+        show_scaled("IR RAW", ir_norm8, SCALE_PREVIEW)
+
+    # ----- undistort
+    if color_bgr is not None:
+        h, w = color_bgr.shape[:2]
+        if rgb_map is None:
+            map1, map2, newK_rgb = build_undistort_maps(rgb_K, rgb_dist, (h, w))
+            rgb_map = (map1, map2)
+        color_und = cv2.remap(color_bgr, rgb_map[0], rgb_map[1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        out_c = os.path.join(undist_dir, f"color_undistorted_{idx}.png")
+        cv2.imwrite(out_c, color_und)
+        print(f"RGB undistorted gespeichert: {os.path.basename(out_c)}")
+        show_scaled("RGB undistorted", color_und, SCALE_PREVIEW)
+
+    if ir is not None:
+        h_ir, w_ir = ir.shape[:2]
+        if ir_map is None:
+            map1_ir, map2_ir, newK_ir = build_undistort_maps(tof_K, tof_dist, (h_ir, w_ir))
+            ir_map = (map1_ir, map2_ir)
+        ir_und = cv2.remap(ir, ir_map[0], ir_map[1], interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+        np.save(os.path.join(undist_dir, f"ir_undistorted_{idx}_raw.npy"), ir_und)
+        ir_und_8 = cv2.convertScaleAbs(ir_und, alpha=255.0/max(1, np.max(ir_und)))
+        cv2.imwrite(os.path.join(undist_dir, f"ir_undistorted_{idx}.png"), ir_und_8)
+        print(f"IR undistorted gespeichert: ir_undistorted_{idx}(.npy/.png)")
+        show_scaled("IR undistorted", ir_und_8, SCALE_PREVIEW)
+
+    #   Charuco erkennen auf  undistorted
+    try:
+        DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+        board = cv2.aruco.CharucoBoard((10, 7), 65/1000.0, 48/1000.0, DICT)
+        params = cv2.aruco.DetectorParameters()
+        aruco_det = cv2.aruco.ArucoDetector(DICT, params)
+
+        if color_bgr is not None:
+            gray = cv2.cvtColor(color_und, cv2.COLOR_BGR2GRAY)
+            mc, ids, _ = aruco_det.detectMarkers(gray)
+            vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            if ids is not None and len(ids) > 0:
+                cv2.aruco.drawDetectedMarkers(vis, mc, ids)
+                # CharucoDetector جدید اگر موجود نیست، interpolateCornersCharuco استفاده می‌کنیم
+                retval, ch_c, ch_ids = cv2.aruco.interpolateCornersCharuco(mc, ids, gray, board)
+                if retval and retval >= 4:
+                    cv2.aruco.drawDetectedCornersCharuco(vis, ch_c, ch_ids)
+                    print(f"ChArUco im RGB undistorted: {int(retval)} Ecken")
+                show_scaled("RGB charuco debug", vis, SCALE_PREVIEW)
+
+        if ir is not None:
+            gray_ir = ir_und_8
+            mc, ids, _ = aruco_det.detectMarkers(gray_ir)
+            vis_ir = cv2.cvtColor(gray_ir, cv2.COLOR_GRAY2BGR)
+            if ids is not None and len(ids) > 0:
+                cv2.aruco.drawDetectedMarkers(vis_ir, mc, ids)
+                retval, ch_c, ch_ids = cv2.aruco.interpolateCornersCharuco(mc, ids, gray_ir, board)
+                if retval and retval >= 4:
+                    cv2.aruco.drawDetectedCornersCharuco(vis_ir, ch_c, ch_ids)
+                    print(f"ChArUco im IR undistorted: {int(retval)} Ecken")
+                show_scaled("IR charuco debug", vis_ir, SCALE_PREVIEW)
+
+        if SHOW_PREVIEW:
+            print("Press any key on a preview window to close…")
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+    except Exception as e:
+        print(f"(Hinweis) Charuco-Debug übersprungen: {e}")
+
+    #cam.close()
+    print("Fertig.")
