@@ -16,8 +16,8 @@ TOF_CALIB_SIZE = None        # z.B. (1024,1024) (Breite,Höhe)
 # ========================= Board-Parameter =========================
 BOARD_COLS = 10
 BOARD_ROWS = 7
-CHECKER_MM = 80.0            # <- Wenn du gemessen hast: hier realen Wert eintragen!
-MARKER_MM  = 60.0
+CHECKER_MM = 78.83            # hier sind realen Wert eintragen!
+MARKER_MM  = 59.42
 DICT_NAME  = cv2.aruco.DICT_4X4_250
 
 # Qualitätsfilter
@@ -150,11 +150,13 @@ def detect_charuco(gray, board, detector):
 
 def pose_from_charuco(K, dist, ch_c, ch_id, board):
     obj = board.getChessboardCorners()[ch_id.flatten()]
-    img = ch_c.reshape(-1,2).astype(np.float32)
+    img = ch_c.reshape(-1, 2).astype(np.float32)
     ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-    if not ok: return None, None
-    R,_ = cv2.Rodrigues(rvec)
-    return R, tvec
+    if not ok:
+        return None, None, None, None
+    R, _ = cv2.Rodrigues(rvec)
+    return R, tvec, rvec, tvec
+
 
 def se3_median(Rs, ts):
     rvecs = [cv2.Rodrigues(R)[0].ravel() for R in Rs]
@@ -163,14 +165,26 @@ def se3_median(Rs, ts):
     t_med = np.median(np.stack(ts,0),0).reshape(3,1)
     return R_med, t_med
 
-def project_debug(rgb_bgr, K, dist, board, R, t):
+def project_debug(rgb_img, K, D, board, R, t):
     obj = board.getChessboardCorners()
-    rvec,_ = cv2.Rodrigues(R)
-    pts,_  = cv2.projectPoints(obj, rvec, t, K, dist)
-    out = rgb_bgr.copy()
-    for p in pts.reshape(-1,2):
-        cv2.circle(out, tuple(np.round(p).astype(int)), 3, (0,0,255), -1)
+    rvec, _ = cv2.Rodrigues(R)
+    pts, _  = cv2.projectPoints(obj, rvec, t, K, D)
+
+    out = rgb_img.copy()
+    pts = pts.reshape(-1, 2)
+
+    # 1) Nur endliche Punkte behalten
+    mask = np.isfinite(pts).all(axis=1)
+    pts = np.round(pts[mask]).astype(int)
+
+    # 2) Optional: nur Punkte im Bild zeichnen
+    h, w = out.shape[:2]
+    for x, y in pts:
+        if 0 <= x < w and 0 <= y < h:
+            cv2.circle(out, (x, y), 3, (0, 0, 255), -1)
+
     return out
+
 
 # ========================= Hauptteil =========================
 def main():
@@ -191,6 +205,7 @@ def main():
     # Falls Kalibrierauflösung ≠ aktuelle RAW-Auflösung, skalieren wir K passend
     # (wird pro Bild geprüft und nur bei Bedarf angewandt)
     R_list, t_list, used = [], [], 0
+    frames = []  # <-- NEU: pro-Frame-Daten für RMS speichern
 
     for (rgb_path, ir_tagpath, idx) in pairs:
         rgb = cv2.imread(rgb_path)                      # BGR (RAW)
@@ -217,18 +232,29 @@ def main():
             print(f"[{idx}] zu wenige Ecken (RGB={n_rgb}, IR={n_ir})"); continue
 
         # PnP je Kamera (RAW -> mit K und D!)
-        R_rgb, t_rgb = pose_from_charuco(K_rgb_use, D_rgb_use, cr_rgb, id_rgb, board)
-        R_tof, t_tof = pose_from_charuco(K_tof_use, D_tof_use, cr_ir,  id_ir,  board)
+        R_rgb, t_rgb, rvec_rgb, tvec_rgb = pose_from_charuco(K_rgb_use, D_rgb_use, cr_rgb, id_rgb, board)
+        R_tof, t_tof, rvec_tof, tvec_tof = pose_from_charuco(K_tof_use, D_tof_use, cr_ir, id_ir, board)
         if R_rgb is None or R_tof is None:
-            print(f"[{idx}] solvePnP fehlgeschlagen"); continue
+            print(f"[{idx}] solvePnP fehlgeschlagen");
+            continue
 
-        # Relativpose: T_rgb_tof = T_rgb_board * inv(T_tof_board)
+        # Relativpose
         R_rgb_tof = R_rgb @ R_tof.T
         t_rgb_tof = t_rgb - R_rgb_tof @ t_tof
 
         R_list.append(R_rgb_tof)
         t_list.append(t_rgb_tof)
         used += 1
+
+        # --------- NEU: alles für RMS speichern ---------
+        frames.append({
+            "idx": idx,
+            "ch_rgb": cr_rgb, "id_rgb": id_rgb,
+            "ch_ir": cr_ir, "id_ir": id_ir,
+            "rvec_rgb": rvec_rgb, "tvec_rgb": tvec_rgb,  # Pose der RGB-Kamera zu diesem Board
+            "R_tof": R_tof, "t_tof": t_tof  # Pose der ToF-Kamera zu diesem Board
+        })
+        # -----------------------------------------------
 
     if used < MIN_PAARE:
         raise RuntimeError(f"Nicht genug gültige Paare ({used}/{MIN_PAARE}).")
@@ -253,6 +279,49 @@ def main():
     reproj = project_debug(first_rgb, K_rgb, D_rgb, board, R_med, t_med)
     cv2.imwrite(os.path.join(SAVE_DIR, "reprojection_debug_raw.png"), reproj)
     print(f"\nErgebnisse gespeichert in:\n{SAVE_DIR}")
+
+    print("\n--- RMS-Reprojektionstest (korrekt) ---")
+    obj_all = board.getChessboardCorners()
+
+    rms_rgb_direct = []  # Reproj mit der tatsächlichen RGB-Pose dieses Frames
+    rms_ir_to_rgb = []  # Reproj: Board-Pose aus IR -> via Extrinsik -> RGB
+
+    for f in frames:
+        # gemeinsame IDs zwischen RGB und IR
+        ids_rgb = f["id_rgb"].flatten()
+        ids_ir = f["id_ir"].flatten()
+        ids_int = np.intersect1d(ids_rgb, ids_ir)
+        if len(ids_int) == 0:
+            continue
+
+        # Index-Mapping
+        sel_rgb = np.nonzero(np.in1d(ids_rgb, ids_int))[0]
+        sel_ir = np.nonzero(np.in1d(ids_ir, ids_int))[0]
+
+        # 2D-Charuco in RGB (nur gemeinsame IDs)
+        ch_rgb = f["ch_rgb"][sel_rgb]
+        # 3D-Punkte am Board (Meter)
+        obj = obj_all[ids_int]
+
+        # (A) Direkt: Projektion mit der RGB-Pose dieses Frames
+        projA, _ = cv2.projectPoints(obj, f["rvec_rgb"], f["tvec_rgb"], K_rgb, D_rgb)
+        errA = cv2.norm(ch_rgb, projA, cv2.NORM_L2) / len(ids_int)
+        rms_rgb_direct.append(float(errA))
+
+        # (B) Über Extrinsik: erst Board->ToF (Pose dieses Frames), dann ToF->RGB (R_med,t_med)
+        R_est = R_med @ f["R_tof"]
+        t_est = R_med @ f["t_tof"] + t_med
+        rvec_est, _ = cv2.Rodrigues(R_est)
+
+        projB, _ = cv2.projectPoints(obj, rvec_est, t_est, K_rgb, D_rgb)
+        errB = cv2.norm(ch_rgb, projB, cv2.NORM_L2) / len(ids_int)
+        rms_ir_to_rgb.append(float(errB))
+
+    if rms_rgb_direct:
+        print(f"RMS (RGB direkt, px):         mean={np.mean(rms_rgb_direct):.3f}, std={np.std(rms_rgb_direct):.3f}")
+    if rms_ir_to_rgb:
+        print(f"RMS (IR→RGB via Extr., px):   mean={np.mean(rms_ir_to_rgb):.3f}, std={np.std(rms_ir_to_rgb):.3f}")
+
 
 if __name__ == "__main__":
     main()

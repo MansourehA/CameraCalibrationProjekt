@@ -125,7 +125,7 @@ if __name__ == "__main__":
         image_dir=image_folder,
         num_rows=10,
         num_cols=7,
-        square_length_mm=65,
-        marker_length_mm=48,
+        square_length_mm=64.88,
+        marker_length_mm=47.53,
         camera_serial="000369930112"
     )
